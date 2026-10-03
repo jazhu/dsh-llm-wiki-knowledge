@@ -45,15 +45,109 @@ const ALL_FOLDERS = '__all__'
 const API_BASE = 'http://127.0.0.1:18771'
 const API = API_BASE + '/kb-api'
 
+/** localStorage key holding a token the user pasted in by hand. */
+const TOKEN_KEY = 'dsh-kb-token'
+
+/**
+ * Access-token state.
+ *
+ * `GET /_session` hands the token to same-machine callers (no `Origin`, or a
+ * loopback `Origin`) and blanks it for everyone else, so a hostile web page
+ * cannot read it out of the panel's own origin. A token pasted by hand lives in
+ * localStorage and always wins; the bootstrapped one stays in memory only.
+ */
+let sessionToken = ''
+let sessionProbed = false
+let tokenNotice: ((reason: string) => void) | null = null
+
+/** Registered by the page so the API layer can raise the token gate. */
+function setTokenNotice(fn: ((reason: string) => void) | null): void {
+  tokenNotice = fn
+}
+
+function manualToken(): string {
+  try {
+    return (localStorage.getItem(TOKEN_KEY) || '').trim()
+  } catch {
+    return '' // private mode / storage disabled — memory only
+  }
+}
+
+function setManualToken(token: string): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch { /* keep going: the session token still works this reload */ }
+}
+
+/**
+ * Adopt a token the host just handed back (settings save / rotation) so the
+ * page that performed the rotation keeps working without reloading.
+ */
+function adoptToken(token: string): void {
+  const next = (token || '').trim()
+  if (!next) return
+  sessionToken = next
+  sessionProbed = true
+  // A hand-pasted token would keep winning over the rotated one; drop it.
+  if (manualToken() && manualToken() !== next) setManualToken(next)
+}
+
+/** Resolve the token to send, bootstrapping once from the exempt session route. */
+async function ensureToken(): Promise<string> {
+  const manual = manualToken()
+  if (manual) return manual
+  if (sessionToken) return sessionToken
+  if (sessionProbed) return ''
+  sessionProbed = true
+  try {
+    const res = await fetch(API + '/_session')
+    const json = (await res.json()) as any
+    if (json?.ok) sessionToken = typeof json.token === 'string' ? json.token : ''
+  } catch { /* leave empty — the gate will ask for a token by hand */ }
+  return sessionToken
+}
+
+const TOKEN_HINT =
+  '知识库服务已开启访问令牌保护。请在「设置」页复制令牌，粘贴到下面后连接。'
+
+/**
+ * Every API call goes through here so the token is attached in one place.
+ *
+ * A 401 is retried exactly once after dropping the cached token: the host
+ * rotates tokens from the settings tab, and an open page is very likely still
+ * holding the old one. A second 401 means the token cannot be obtained here, so
+ * the page raises its manual-entry gate instead of showing "service down".
+ */
+async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const send = async (token: string): Promise<Response> => {
+    const headers: Record<string, string> = { ...(init?.headers as any) }
+    if (token) headers['X-KB-Token'] = token
+    return fetch(API + path, { ...init, headers })
+  }
+
+  const token = await ensureToken()
+  let res = await send(token)
+  if (res.status !== 401) return res
+
+  if (token && token === manualToken()) setManualToken('')
+  sessionToken = ''
+  sessionProbed = false
+  const fresh = await ensureToken()
+  if (fresh && fresh !== token) res = await send(fresh)
+  if (res.status === 401) tokenNotice?.(TOKEN_HINT)
+  return res
+}
+
 async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(API + path)
+  const res = await apiFetch(path)
   const json = (await res.json()) as any
   if (!json.ok) throw new Error(json?.error?.message || 'request failed')
   return json as T
 }
 
 async function apiDelete(path: string): Promise<void> {
-  const res = await fetch(API + path, { method: 'DELETE' })
+  const res = await apiFetch(path, { method: 'DELETE' })
   const json = (await res.json()) as any
   if (!json.ok) throw new Error(json?.error?.message || 'delete failed')
 }
@@ -66,7 +160,7 @@ async function apiDelete(path: string): Promise<void> {
  * needs the new folder list so the tree does not have to wait for the next poll.
  */
 async function apiDeleteJson<T = any>(path: string): Promise<T> {
-  const res = await fetch(API + path, { method: 'DELETE' })
+  const res = await apiFetch(path, { method: 'DELETE' })
   const json = (await res.json()) as any
   if (!json.ok) throw new Error(json?.error?.message || 'delete failed')
   return json as T
@@ -74,7 +168,7 @@ async function apiDeleteJson<T = any>(path: string): Promise<T> {
 
 /** Raw text body (the Markdown export route answers with text/markdown). */
 async function apiText(path: string): Promise<string> {
-  const res = await fetch(API + path)
+  const res = await apiFetch(path)
   if (!res.ok) {
     // Errors are JSON even on the text route, so surface the real message.
     let message = `HTTP ${res.status}`
@@ -88,7 +182,7 @@ async function apiText(path: string): Promise<string> {
 }
 
 async function apiPost(path: string): Promise<any> {
-  const res = await fetch(API + path, { method: 'POST' })
+  const res = await apiFetch(path, { method: 'POST' })
   const json = (await res.json()) as any
   if (!json.ok) throw new Error(json?.error?.message || 'request failed')
   return json
@@ -96,7 +190,7 @@ async function apiPost(path: string): Promise<any> {
 
 /** POST with a JSON body (tag edits, retrieval from the settings tab). */
 async function apiPostJson(path: string, body: unknown): Promise<any> {
-  const res = await fetch(API + path, {
+  const res = await apiFetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -106,9 +200,20 @@ async function apiPostJson(path: string, body: unknown): Promise<any> {
   return json
 }
 
-/** Absolute URL of an export file; `download` makes the server send it as an attachment. */
+/**
+ * Absolute URL of an export file; `download` makes the server send it as an attachment.
+ *
+ * Downloads and `<img src>` navigations cannot carry a custom header, so the
+ * token rides in the query string — `readRequestToken` on the host accepts it as
+ * a fallback. By the time any of these links can be clicked, `refresh()` has
+ * already gone through `ensureToken()`, so the token is in hand.
+ */
 function exportUrl(id: string, kind: 'md' | 'mindmap', download = false): string {
-  return `${API}/doc/${encodeURIComponent(id)}/${kind}${download ? '?download=1' : ''}`
+  const query: string[] = []
+  if (download) query.push('download=1')
+  const token = sessionToken || manualToken()
+  if (token) query.push('token=' + encodeURIComponent(token))
+  return `${API}/doc/${encodeURIComponent(id)}/${kind}${query.length ? '?' + query.join('&') : ''}`
 }
 
 /**
@@ -500,6 +605,11 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
   // Folders whose children are shown. A Set of ids rather than a "current path"
   // string, so expanding two branches at once does not collapse the first.
   const [openFolders, setOpenFolders] = useState<string[]>([])
+  // Access-token gate. `tokenGate` holds the reason the API layer could not
+  // authenticate; while set, the panel shows a paste box instead of the usual
+  // 「service unreachable」 error, because the service is in fact running.
+  const [tokenGate, setTokenGate] = useState<string | null>(null)
+  const [tokenDraft, setTokenDraft] = useState('')
   const fileRef = useRef<HTMLInputElement | null>(null)
   const pollRef = useRef<number | null>(null)
 
@@ -515,6 +625,14 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
     return () => { toastBridge = null }
   }, [showToast])
 
+  // Same idea for the token gate: the API layer is module-level and needs a way
+  // to tell the page that a token is required but could not be bootstrapped
+  // (the host only discloses it to same-machine callers).
+  useEffect(() => {
+    setTokenNotice((reason: string) => setTokenGate(reason))
+    return () => setTokenNotice(null)
+  }, [])
+
   const refresh = useCallback(async () => {
     try {
       const [d, s] = await Promise.all([
@@ -527,6 +645,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
       setStatus(s)
       setGraphAvail(s.graph.nodeCount > 0)
       setErr(null)
+      setTokenGate(null)
     } catch (e) {
       setErr('无法连接知识库服务：' + (e as Error).message + '（请确认插件已加载且服务在运行）')
     }
@@ -539,6 +658,18 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
       if (pollRef.current) window.clearInterval(pollRef.current)
     }
   }, [refresh])
+
+  // Paste-the-token path. The stored token wins over the bootstrapped one from
+  // now on, so a page that cannot reach `/_session` still works.
+  const connectWithToken = useCallback(async () => {
+    const token = tokenDraft.trim()
+    if (!token) return
+    setManualToken(token)
+    setTokenDraft('')
+    setTokenGate(null)
+    setErr(null)
+    await refresh()
+  }, [refresh, tokenDraft])
 
   // The folder id travels as a sibling multipart field. An empty string means
   // 「根目录」 and is omitted from the form entirely so an old host build (which
@@ -554,7 +685,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
           const fd = new FormData()
           fd.append('file', file, file.name)
           if (target) fd.append('folderId', target)
-          const res = await fetch(API + '/upload', { method: 'POST', body: fd })
+          const res = await apiFetch('/upload', { method: 'POST', body: fd })
           const json = (await res.json()) as any
           if (!json.ok) throw new Error(json?.error?.message || 'upload failed')
           if (json.folderFallback) fellBack = String(json.folderFallback)
@@ -602,9 +733,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
   const reEnrich = useCallback(
     async (id: string) => {
       try {
-        const res = await fetch(API + '/parse/' + encodeURIComponent(id), { method: 'POST' })
-        const json = (await res.json()) as any
-        if (!json.ok) throw new Error(json?.error?.message || 'request failed')
+        const json = await apiPost('/parse/' + encodeURIComponent(id))
         showToast(json.queued === false ? '该文档已在解析队列中' : '已开始重新提取（不调用 LLM）')
         await refresh()
       } catch (e) {
@@ -621,9 +750,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
   const enrichDoc = useCallback(
     async (id: string) => {
       try {
-        const res = await fetch(API + '/enrich/' + encodeURIComponent(id), { method: 'POST' })
-        const json = (await res.json()) as any
-        if (!json.ok) throw new Error(json?.error?.message || 'request failed')
+        const json = await apiPost('/enrich/' + encodeURIComponent(id))
         showToast(json.note || '已开始 LLM 增强')
         await refresh()
       } catch (e) {
@@ -639,13 +766,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
   const enrichAll = useCallback(
     async (ids: string[]) => {
       try {
-        const res = await fetch(API + '/enrich-all', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ docIds: ids }),
-        })
-        const json = (await res.json()) as any
-        if (!json.ok) throw new Error(json?.error?.message || 'request failed')
+        const json = await apiPostJson('/enrich-all', { docIds: ids })
         showToast(json.note || `已排入 ${json.queued} 篇文档`)
         await refresh()
       } catch (e) {
@@ -661,9 +782,7 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
   const cancelParse = useCallback(
     async (id: string) => {
       try {
-        const res = await fetch(API + '/cancel/' + encodeURIComponent(id), { method: 'POST' })
-        const json = (await res.json()) as any
-        if (!json.ok) throw new Error(json?.error?.message || 'request failed')
+        const json = await apiPost('/cancel/' + encodeURIComponent(id))
         showToast(json.note || '已停止解析')
         await refresh()
       } catch (e) {
@@ -854,7 +973,22 @@ function KnowledgePage({ onBack }: { onBack?: () => void }) {
         ),
       ),
       h('div', { style: bodyStyle },
-        err ? h('div', { className: 'kb-errorbox' }, err) : null,
+        tokenGate
+          ? h('div', { className: 'kb-errorbox', style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+              h('div', null, tokenGate),
+              h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+                h('input', {
+                  className: 'kb-folder-input',
+                  style: { flex: '1 1 320px', minWidth: 0 },
+                  type: 'password',
+                  placeholder: '粘贴访问令牌',
+                  value: tokenDraft,
+                  onInput: (e: any) => setTokenDraft(e.target.value),
+                  onKeyDown: (e: any) => { if (e.key === 'Enter') void connectWithToken() },
+                }),
+                h('button', { className: 'kb-btn', onClick: () => void connectWithToken() }, '保存并连接')))
+          : null,
+        !tokenGate && err ? h('div', { className: 'kb-errorbox' }, err) : null,
         focusEntity
           ? h('div', { style: { padding: '8px 14px 0', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
             h('span', { className: 'kb-chip' }, '聚焦实体：' + focusEntity,
@@ -1819,6 +1953,11 @@ function SettingsPane({ refresh }: { refresh: () => void }) {
   const [concurrency, setConcurrency] = useState(4)
   const [saving, setSaving] = useState(false)
   const [backendNote, setBackendNote] = useState<string | null>(null)
+  // Access-token settings (mirrors the host's settings.json `apiToken*`).
+  const [authEnabled, setAuthEnabled] = useState(true)
+  const [authToken, setAuthToken] = useState('')
+  const [showToken, setShowToken] = useState(false)
+  const [rotating, setRotating] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -1832,6 +1971,8 @@ function SettingsPane({ refresh }: { refresh: () => void }) {
       setModels(json.models ?? [])
       setMaxEnrich(Number(s.maxEnrichChunks ?? 400))
       setConcurrency(Number(s.enrichConcurrency ?? 4))
+      setAuthEnabled(s.apiTokenEnabled !== false)
+      setAuthToken(String(s.apiToken || ''))
       setBackendNote(json.note ?? null)
       return true
     } catch (e) {
@@ -1865,31 +2006,50 @@ function SettingsPane({ refresh }: { refresh: () => void }) {
     setModel('')
   }, [previewModels])
 
-  const save = useCallback(async () => {
+  // Persist everything at once: LLM/enrichment fields plus the access token.
+  // `rotate` lets the caller invalidate a leaked token; the host mints a fresh
+  // one and returns it in `settings`, which we adopt so this page stays in.
+  const persist = useCallback(async (rotate: boolean) => {
     setSaving(true)
     try {
-      const res = await fetch(API + '/settings', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          llmEnabled: enabled,
-          llmProvider: provider,
-          llmModel: model,
-          maxEnrichChunks: Math.max(0, Math.floor(Number(maxEnrich) || 0)),
-          enrichConcurrency: Math.min(8, Math.max(1, Math.floor(Number(concurrency) || 4))),
-        }),
+      const json = await apiPostJson('/settings', {
+        llmEnabled: enabled,
+        llmProvider: provider,
+        llmModel: model,
+        maxEnrichChunks: Math.max(0, Math.floor(Number(maxEnrich) || 0)),
+        enrichConcurrency: Math.min(8, Math.max(1, Math.floor(Number(concurrency) || 4))),
+        apiTokenEnabled: authEnabled,
+        rotateToken: rotate,
       })
-      const json = (await res.json()) as any
-      if (!json.ok) throw new Error(json?.note || json?.error?.message || '保存失败')
+      const s = json?.settings ?? {}
+      if (s.apiToken) {
+        adoptToken(String(s.apiToken))
+        setAuthToken(String(s.apiToken))
+      }
+      setAuthEnabled(s.apiTokenEnabled !== false)
       setBackendNote(json.note ?? null)
-      showToastSafe(json.ok ? '已保存，LLM 增强设置即时生效' : '已保存，但后端未生效：' + (json.note || ''))
+      showToastSafe(json.ok ? '已保存，设置即时生效' : '已保存，但后端未生效：' + (json.note || ''))
       refresh()
+      return true
     } catch (e) {
       showToastSafe('保存失败：' + (e as Error).message)
+      return false
     } finally {
       setSaving(false)
     }
-  }, [enabled, provider, model, maxEnrich, concurrency, refresh])
+  }, [enabled, provider, model, maxEnrich, concurrency, authEnabled, refresh])
+
+  const save = useCallback(() => persist(false), [persist])
+
+  const rotateToken = useCallback(async () => {
+    setRotating(true)
+    try {
+      const ok = await persist(true)
+      if (ok) showToastSafe('已生成新令牌，旧令牌立即失效')
+    } finally {
+      setRotating(false)
+    }
+  }, [persist])
 
   // Settings fields are laid out label-above-control inside a card; the two
   // style objects below are the only per-control sizing left.
@@ -1996,6 +2156,43 @@ function SettingsPane({ refresh }: { refresh: () => void }) {
             }),
             h('div', { className: 'kb-sethint' },
               '同时进行的增强请求数（1–8）；越大越快，也越容易触发提供方限流'),
+          ),
+        ),
+        // ---- card 3: access token ------------------------------------------
+        h('div', { className: 'kb-setcard' },
+          h('div', { className: 'kb-setcard-title' },
+            '访问令牌',
+            h('button', {
+              className: 'kb-btn sm' + (authEnabled ? ' on' : ''),
+              style: authEnabled
+                ? { marginLeft: 'auto', color: 'var(--dsw-alias-state-success-primary, #22c55e)', borderColor: 'color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 40%, transparent)' }
+                : { marginLeft: 'auto' },
+              onClick: () => setAuthEnabled((v) => !v),
+            }, authEnabled ? '已开启' : '已关闭'),
+          ),
+          h('div', { className: 'kb-setfield' },
+            h('div', { className: 'kb-setlabel' }, '令牌'),
+            h('div', { className: 'kb-setcontrol' },
+              h('input', {
+                className: 'kb-search', style: { flex: 1, minWidth: 0, fontFamily: 'ui-monospace, monospace', fontSize: 12 },
+                readOnly: true, value: authToken ? (showToken ? authToken : authToken.slice(0, 6) + '…' + authToken.slice(-4)) : '（未生成）',
+                title: authToken,
+              }),
+              h('button', { className: 'kb-btn plain', onClick: () => setShowToken((v) => !v) }, showToken ? '隐藏' : '显示'),
+              h('button', {
+                className: 'kb-btn plain', disabled: !authToken,
+                onClick: () => {
+                  if (!authToken) return
+                  try {
+                    void navigator.clipboard?.writeText(authToken)
+                    showToastSafe('令牌已复制到剪贴板')
+                  } catch { showToastSafe('复制失败，请手动选中后复制') }
+                },
+              }, '复制'),
+              h('button', { className: 'kb-btn plain', disabled: saving || rotating, onClick: () => void rotateToken() }, rotating ? '生成中…' : '重新生成'),
+            ),
+            h('div', { className: 'kb-sethint' },
+              '开启后，本机面板会自动带上令牌访问知识库接口；令牌同时以明文保存在 settings.json。担心泄露时点「重新生成」，旧令牌立刻失效（正在打开的页面会自动重连）。'),
           ),
         ),
       ),

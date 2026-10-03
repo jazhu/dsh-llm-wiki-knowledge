@@ -34,7 +34,7 @@
 // free and seconds long, so it runs on upload; enrichment costs provider calls
 // and takes minutes, so the user starts it. See parse-runner.ts.
 
-import { randomUUID } from 'node:crypto'
+import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -77,6 +77,12 @@ export interface Config {
   maxEnrichChunks: number
   /** Concurrent enrichment requests per document. */
   enrichConcurrency: number
+  /**
+   * Require `X-KB-Token` on every functional `/kb-api` route. Enabled by
+   * default: the loopback API is otherwise reachable from any web page the user
+   * visits while the harness is running.
+   */
+  apiTokenEnabled: boolean
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -94,6 +100,7 @@ export const DEFAULT_CONFIG: Config = {
   llmModel: 'glm-5.3-flash',
   maxEnrichChunks: MAX_ENRICH_CHUNKS,
   enrichConcurrency: DEFAULT_ENRICH_CONCURRENCY,
+  apiTokenEnabled: true,
 }
 
 function resolveConfig(config?: Partial<Config>, profileDataDir?: string): Config {
@@ -118,6 +125,7 @@ function resolveConfig(config?: Partial<Config>, profileDataDir?: string): Confi
     llmModel: config?.llmModel ?? DEFAULT_CONFIG.llmModel,
     maxEnrichChunks: config?.maxEnrichChunks ?? DEFAULT_CONFIG.maxEnrichChunks,
     enrichConcurrency: config?.enrichConcurrency ?? DEFAULT_CONFIG.enrichConcurrency,
+    apiTokenEnabled: config?.apiTokenEnabled ?? DEFAULT_CONFIG.apiTokenEnabled,
   }
 }
 
@@ -139,10 +147,37 @@ interface KbSettings {
   maxEnrichChunks: number
   /** Concurrent enrichment requests per document (1..8). */
   enrichConcurrency: number
+  /**
+   * Master switch for HTTP token authentication. When `true`, every functional
+   * `/kb-api` route rejects requests without a matching `X-KB-Token`.
+   */
+  apiTokenEnabled: boolean
+  /**
+   * The bearer secret for `/kb-api`, persisted in plaintext next to the model
+   * settings. Generated on demand, rotatable, and cleared when auth is off.
+   */
+  apiToken: string
 }
 
 const SETTINGS_FILE = 'settings.json'
 const MAX_ENRICH_CONCURRENCY = 8
+
+/** Fresh 192-bit secret, URL-safe so it survives copy/paste and query strings. */
+function newApiToken(): string {
+  return randomBytes(24).toString('base64url')
+}
+
+/**
+ * Constant-time token comparison. Length is compared first (that part is not
+ * secret) and the byte comparison only runs on equal-length inputs.
+ */
+function tokenMatches(expected: string, provided: string): boolean {
+  if (!expected || !provided) return false
+  const a = Buffer.from(expected, 'utf-8')
+  const b = Buffer.from(provided, 'utf-8')
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
 
 function readSettings(dataDir: string, fallback: KbSettings): KbSettings {
   try {
@@ -154,6 +189,8 @@ function readSettings(dataDir: string, fallback: KbSettings): KbSettings {
       llmModel: typeof obj.llmModel === 'string' && obj.llmModel ? obj.llmModel : fallback.llmModel,
       maxEnrichChunks: numOr(obj.maxEnrichChunks, fallback.maxEnrichChunks),
       enrichConcurrency: clampConcurrency(numOr(obj.enrichConcurrency, fallback.enrichConcurrency)),
+      apiTokenEnabled: typeof obj.apiTokenEnabled === 'boolean' ? obj.apiTokenEnabled : fallback.apiTokenEnabled,
+      apiToken: typeof obj.apiToken === 'string' ? obj.apiToken.trim() : fallback.apiToken,
     }
   } catch {
     return fallback
@@ -357,7 +394,16 @@ function activate(ctx: ContextLike, config?: Partial<Config>): void {
     llmModel: resolved.llmModel,
     maxEnrichChunks: resolved.maxEnrichChunks,
     enrichConcurrency: resolved.enrichConcurrency,
+    apiTokenEnabled: DEFAULT_CONFIG.apiTokenEnabled,
+    apiToken: '',
   })
+  // A token must exist the moment auth is on, otherwise every route would
+  // reject every caller and the panel could never authenticate itself. Mint it
+  // once here and persist so the user finds it in the settings tab.
+  if (settings.apiTokenEnabled && !settings.apiToken) {
+    settings = { ...settings, apiToken: newApiToken() }
+    writeSettings(resolved.dataDir, settings)
+  }
 
   /**
    * Compute which enrichment backend to use for a given settings snapshot.
@@ -620,7 +666,11 @@ function activate(ctx: ContextLike, config?: Partial<Config>): void {
       // loopback API regardless of origin.
       res.setHeader('Access-Control-Allow-Origin', '*')
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      // `X-KB-Token` is a non-simple header, so every authenticated browser call
+      // is preflighted; without it here the browser drops the token header and
+      // the panel would 401 against itself.
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-KB-Token')
+      res.setHeader('Access-Control-Max-Age', '300')
       if (req.method === 'OPTIONS') {
         res.statusCode = 204
         res.end()
@@ -812,14 +862,89 @@ interface LlmInfo {
   deepseekConfigured: boolean
 }
 
+/**
+ * Bootstrap for the browser panel: hands the token to a caller that is NOT a
+ * hostile web origin. Browsers always send `Origin` on cross-origin fetches, so
+ * an absent `Origin` (same-origin request, node/curl, desktop webview) or a
+ * loopback `Origin` is accepted. A remote origin such as `https://evil.test`
+ * gets the token withheld and must ask the user to paste it in instead.
+ *
+ * This is the only unauthenticated `/kb-api` route; everything else goes
+ * through the `X-KB-Token` check below.
+ */
+function originIsLocalOrAbsent(req: NodeIncomingMessage): boolean {
+  const raw = req.headers['origin']
+  const origin = Array.isArray(raw) ? raw[0] : raw
+  if (!origin) return true
+  try {
+    const { hostname } = new URL(origin)
+    return (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname === '[::1]' ||
+      hostname.endsWith('.localhost')
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * True when the request is allowed through the token gate. `path` is the
+ * `/kb-api`-stripped path; `_session` is the documented exemption.
+ */
+function isAuthExempt(method: string, path: string): boolean {
+  if (path === '/_session') return true
+  // CORS preflight carries no credentials (and browsers strip custom headers
+  // from a preflight), so it must be answered before the token check.
+  return method === 'OPTIONS'
+}
+
+/** Pull the token from the header, tolerating both browser and CLI shapes. */
+function readRequestToken(req: NodeIncomingMessage, searchParams: URLSearchParams): string {
+  const raw = req.headers['x-kb-token']
+  const header = Array.isArray(raw) ? raw[0] : raw
+  if (header) return String(header).trim()
+  // Link-based exports (md / mindmap downloads opened in a new tab) cannot set
+  // headers, so they may pass the token as a query parameter instead.
+  return (searchParams.get('token') ?? '').trim()
+}
+
 async function handleApiRequest(deps: HandlerDeps): Promise<void> {
   const { st, runner, llmInfo, settings, req, res } = deps
   const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
   const searchParams = new URL(req.url ?? '/', 'http://dsh.internal').searchParams
   const rest = pathname.startsWith(API_PREFIX) ? pathname.slice(API_PREFIX.length) : pathname
+  const method = req.method ?? 'GET'
+
+  // Token gate for every functional route. The host `kb_*` tools never reach
+  // here: they call the store/search APIs in-process, so they stay usable from
+  // the agent even when HTTP auth is on.
+  const auth = settings?.get()
+  if (auth?.apiTokenEnabled && auth.apiToken && !isAuthExempt(method, rest)) {
+    const provided = readRequestToken(req, searchParams)
+    if (!tokenMatches(auth.apiToken, provided)) {
+      writeError(res, 'unauthorized', '缺少或无效的知识库访问令牌（X-KB-Token）', 401)
+      return
+    }
+  }
 
   // GET routes
   if (req.method === 'GET' || req.method === undefined) {
+    if (rest === '/_session') {
+      const current = settings?.get()
+      const local = originIsLocalOrAbsent(req)
+      writeJson(res, 200, {
+        ok: true,
+        enabled: Boolean(current?.apiTokenEnabled),
+        // Withheld from a non-loopback browser origin; that caller falls back
+        // to the manual token input in the panel.
+        token: local && current?.apiTokenEnabled ? current.apiToken : '',
+        local,
+      })
+      return
+    }
     if (rest === '/' || rest === '/docs') {
       // The outline can hold thousands of entries (a bookmarked manual); the
       // list view only needs its size, so the list stays small and the full
@@ -971,7 +1096,7 @@ async function handleApiRequest(deps: HandlerDeps): Promise<void> {
       }
       writeJson(res, 200, {
         ok: true,
-        settings: current ?? { llmEnabled: false, llmProvider: '', llmModel: '' },
+        settings: current ?? { llmEnabled: false, llmProvider: '', llmModel: '', maxEnrichChunks: 0, enrichConcurrency: DEFAULT_ENRICH_CONCURRENCY, apiTokenEnabled: false, apiToken: '' },
         providers,
         models,
         backend: llmInfo.backend,
@@ -1311,6 +1436,13 @@ async function handleApiRequest(deps: HandlerDeps): Promise<void> {
         return
       }
       const prev = settings.get()
+      // Token lifecycle: enabling auth without a token would lock the panel out
+      // forever, so a token is minted on demand; `rotateToken` mints a fresh one
+      // so a leaked token can be replaced without restarting the host.
+      const wantsEnabled = typeof body.apiTokenEnabled === 'boolean' ? body.apiTokenEnabled : prev.apiTokenEnabled
+      const rotate = body.rotateToken === true
+      let apiToken = typeof body.apiToken === 'string' && body.apiToken.trim() ? body.apiToken.trim() : prev.apiToken
+      if (rotate || (wantsEnabled && !apiToken)) apiToken = newApiToken()
       const next: KbSettings = {
         llmEnabled: typeof body.llmEnabled === 'boolean' ? body.llmEnabled : prev.llmEnabled,
         llmProvider: typeof body.llmProvider === 'string' && body.llmProvider ? body.llmProvider.trim() : prev.llmProvider,
@@ -1318,6 +1450,8 @@ async function handleApiRequest(deps: HandlerDeps): Promise<void> {
         // `0` is a meaningful value here (no ceiling), so only reject junk.
         maxEnrichChunks: numOr(body.maxEnrichChunks, prev.maxEnrichChunks),
         enrichConcurrency: clampConcurrency(numOr(body.enrichConcurrency, prev.enrichConcurrency)),
+        apiTokenEnabled: wantsEnabled,
+        apiToken,
       }
       const result = settings.set(next)
       writeJson(res, 200, { ok: result.ok, note: result.note, settings: settings.get() })

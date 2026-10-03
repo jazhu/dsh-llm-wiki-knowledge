@@ -59,11 +59,13 @@ separate job that only runs when you press a button, in batches you control.
   Assign from the 标签 button, filter the list by clicking a label, or pass `tags`
   to `kb_search` so the assistant answers about one subject only.
 - **Knowledge graph** — a document ↔ entity relation graph drawn as inline SVG
-  (no external graph library).
+  (no external graph library), showing a degree-ranked slice — see
+  [Knowledge graph](#knowledge-graph).
 - **Live progress** — the list shows queue → extract → parse → 待增强 → enrich →
   index → done, with a progress bar and per-step status.
-- **Settings tab** — LLM on/off, provider + model, per-batch size, concurrency and
-  API port, persisted to `<dataDir>/settings.json` and applied without a restart.
+- **Settings tab** — LLM on/off, provider + model, per-batch size, concurrency,
+  the loopback access token, and API port, persisted to
+  `<dataDir>/settings.json` and applied without a restart.
 
 ## Tools
 
@@ -198,6 +200,7 @@ plugin row in the profile's `cordis.patch.yml`:
     maxConcurrent: 2             # documents parsed or enriched at once
     maxEnrichChunks: 400         # chunks per enrichment BATCH (not a cap; 0 = one batch)
     enrichConcurrency: 4         # concurrent enrichment requests per batch (1-8)
+    apiTokenEnabled: true        # require X-KB-Token on every /kb-api route
     deepseekApiKey: ''           # api-key backend / fallback
     deepseekBaseUrl: 'https://api.deepseek.com'
     deepseekModel: 'deepseek-chat'
@@ -222,12 +225,53 @@ plugin row in the profile's `cordis.patch.yml`:
   the run stops with `第 N 批 LLM 增强全部失败…` instead of retrying the same
   doomed batch forever.
 
+### Access token
+
+The loopback API is on your machine, but *any* web page you visit can reach
+`127.0.0.1:18771` from the browser. So the plugin guards itself with a token
+instead of trusting the address:
+
+- **On by default.** When you start the plugin for the first time it generates a
+  192-bit token and saves it, in plaintext, next to your other settings in
+  `<dataDir>/settings.json`.
+- **Every functional `/kb-api` route needs it** — documents, folders, search,
+  graph, status, settings, uploads, enhancement, deletion. Send it as
+  `X-KB-Token: <token>`. A missing or wrong token gets
+  `401 缺少或无效的知识库访问令牌（X-KB-Token）`.
+- **Two routes stay open on purpose**: `OPTIONS` (CORS preflight must work
+  before a token can be sent) and `GET /kb-api/_session`, the bootstrap that the
+  panel itself uses.
+- **`_session` will not hand the token to a random website.** It returns the
+  token only when the request comes from this machine — no `Origin` header, or a
+  loopback one (`localhost`, `127.0.0.1`, `::1`, `*.localhost`). A request from
+  `https://anything-else.example` gets `{"ok":true,"enabled":true,"token":"",
+  "local":false}`: enough to know protection is on, not enough to get past it.
+  A panel served from a non-loopback host therefore asks you to paste the token
+  by hand instead of silently trusting the origin.
+- **The 设置 tab has an 访问令牌 card**: toggle protection, reveal or copy the
+  token, or 重新生成 it. Regenerating invalidates the old token immediately;
+  any panel still open re-reads the token and reconnects on its own.
+- **Token-pasted-in-the-box tokens win** over a bootstrapped one, and are kept
+  in `localStorage` under `dsh-kb-token` so a LAN-served panel keeps working.
+- **Agent tools are unaffected.** `kb_search`, `kb_ask`, `kb_list_documents`,
+  and `kb_read_document` call the store in-process, never over HTTP, so they
+  need no token.
+- **Downloads carry `?token=`.** A browser cannot attach a header to a plain
+  link or an `<img src>`, so Markdown and mind-map export/download links put the
+  token in the query string instead. It is visible in history and local logs —
+  fine for a loopback token, which is why the token is a per-install secret and
+  can be rotated at any time.
+
 ## API
 
 The plugin self-hosts a loopback HTTP API on `apiPort` (bound to `127.0.0.1`,
 CORS enabled) and additionally registers its `/kb-api` prefix with the host
 `webServer` service when that service exists. Both halves of the plugin therefore
 reach the same handler.
+
+Authentication: every route below except `OPTIONS` and `GET /_session` requires
+`X-KB-Token` (or `?token=` for links) while 访问令牌 is enabled — see
+[Access token](#access-token).
 
 | Method | Route | Purpose |
 |--------|-------|---------|
@@ -239,6 +283,7 @@ reach the same handler.
 | GET | `/kb-api/graph` | Document ↔ entity graph (capped). |
 | GET | `/kb-api/status` | Queue depth, backend, `indexedDocs`/`indexedChunks`, `resumedDocs`. |
 | GET | `/kb-api/settings` | Settings, providers, models, backend. |
+| GET | `/kb-api/_session` | Unauthenticated bootstrap for the panel: `{enabled, token, local}` — `token` only for same-machine callers. |
 | POST | `/kb-api/upload` | `multipart/form-data` upload; optional `folderId`. Queues **extraction only**. |
 | POST | `/kb-api/parse/:id` | (Re)queue extraction — free, local, keeps every summary on disk. |
 | POST | `/kb-api/enrich/:id` | Start LLM enhancement for one document; auto-batches until done. Re-posting is refused. |
@@ -253,6 +298,46 @@ reach the same handler.
 | POST | `/kb-api/settings` | Persist and hot-apply settings. |
 | DELETE | `/kb-api/doc/:id` | Delete document, exports, and its index entries. |
 | DELETE | `/kb-api/folder/:id` | Delete a folder and its subtree; its documents are hoisted to the parent (never deleted). |
+
+## Knowledge graph
+
+The 知识图谱 tab draws the document ↔ entity graph as plain inline SVG — no graph
+library, no layout engine, no force simulation. That is a deliberate choice: the
+derivation in `src/store.ts` caps the corpus at 600 nodes / 4000 edges, and a
+StoneOS-sized knowledge base really does hit that ceiling.
+
+At that size a naive force layout is a solid green disc — 600 nodes on one ring
+are ~3 px apart, each label overlapping its neighbours, 4000 chords filling every
+gap. So the canvas draws a **readable slice** and says so:
+
+- **Logical space is fixed** at 1000 × 720 and fitted to the measured container
+  (`min(w/LW, h/LH) * 0.92`, re-run on resize), so the graph never collapses to a
+  blank canvas or overflows its box.
+- **Documents sit on an inner circle**; **entities fill concentric rings**
+  (`RING_MIN = 0.22 · min(LW,LH)`, `RING_MAX = 0.46 · min(LW,LH)`, `RING_GAP = 26`,
+  4 rings, odd rings rotated by half a slot so spokes do not line up). Ring
+  capacity is *physical*: `floor(2πr / RING_GAP)`, which is 38 + 52 + 66 + 80 =
+  **236** — the largest honest entity count.
+- **Entity tiers are the ring capacity, not a guess**: the legend button cycles
+  60 → 150 → 236. The old 300/600 options could not be placed at all and
+  silently dropped nodes.
+- **Entities are ranked by weighted degree** (descending, label as a stable
+  tie-break). A focused entity outside the current tier is promoted in place of
+  the weakest selected one, so clicking a search hit never points at a node that
+  is not drawn.
+- **Edges are budgeted proportionally to the entity tier**:
+  `edgeCap = max(120, round(800 · entLimit / 236))` — about 203 edges at 60
+  entities, 800 at 236 — keeping chord density roughly constant as the tier
+  grows instead of dumping the full 4000 into a small view. Heaviest edges win.
+- **Labels are capped** at the top 40 ranked entities plus the active one; entity
+  names over 14 characters are ellipsized. A document always keeps its label.
+- **Truncation is disclosed, never implied.** The corner hint reports rendered vs.
+  total — `显示 61/600 节点 · 203/4000 关系` — and when anything is hidden it adds
+  the rule that hid it: `按度数取前 60 实体（隐藏 539），边按权重取前 203`.
+- **Interaction**: hover or select highlights the node and its one-hop
+  neighbourhood while dimming the rest; click a document to open it, click an
+  entity to focus it; wheel zooms around the cursor (clamped 0.2–6) and dragging
+  pans; 适配 refits and 刷新 re-derives the graph.
 
 ## Architecture
 
@@ -316,7 +401,7 @@ disk means enrichment was.
   docs/<id>.bin       — original uploaded bytes (kept for re-parse / preview)
   md/<name>.md        — exported Markdown
   md/<name>.mindmap.md — exported mind map
-  settings.json       — settings saved from the 设置 tab
+  settings.json       — settings saved from the 设置 tab (including apiToken)
 ```
 
 The store writes `index.json` via a temp file + rename. On Windows a rename over a
@@ -350,6 +435,15 @@ direct write; a lost index costs summaries, not documents.
 - **`index.json` grows large.** A 2500-chunk manual produces a multi-megabyte
   index; the retrieval index is in memory and rebuilt at startup. This is
   expected, not a leak.
+- **`401 缺少或无效的知识库访问令牌` from a page you did not open here.** The panel
+  bootstraps its token from `/_session`, which only discloses to same-machine
+  callers. A panel served from another address (a phone on the LAN, a remote
+  desktop host) must paste the token by hand, or the page can be locked out until
+  you 重新生成 it in 设置. See [Access token](#access-token).
+- **A download 401s while the panel works.** An `<a download>` and an `<img src>`
+  cannot carry `X-KB-Token`; export links append `?token=` instead. If the token
+  was rotated between render and click, press 重新生成 once in 设置, or reload the
+  page so the links pick up the new token.
 
 ## Notes
 
