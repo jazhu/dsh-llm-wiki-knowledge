@@ -1,0 +1,56 @@
+{
+  "name": "dsh-llm-wiki-knowledge",
+  "displayName": "DSH LLM Wiki 知识库",
+  "description": "把 PDF / Word / Markdown / HTML / 文本等文档解析成可检索的知识库：按文档真实目录（PDF 书签、Markdown 标题、编号标题）切分片段，生成 Markdown、知识脑图与知识图谱，并可选调用 LLM 为片段补写小结、抽取实体与关联。支持断点续传、随时停止、文档标签筛选；同时向宿主注册 kb_list_documents / kb_search / kb_read_document / kb_ask 四个工具，让助手直接在对话里检索并引用已导入的资料。",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/index.mjs",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./client": "./dist/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "knowledge-base",
+    "knowledge-graph",
+    "rag",
+    "wiki",
+    "llm"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node test/structure.test.ts && node test/retrieve.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "markmap-lib": "^0.18.12",
+    "markmap-view": "^0.18.12",
+    "pdfjs-dist": "^4.4.168"
+  }
+}

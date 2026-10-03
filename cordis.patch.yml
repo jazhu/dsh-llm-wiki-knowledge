@@ -1,0 +1,19 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+- insert:
+    - id: dsh-llm-wiki-knowledge
+      name: dsh-llm-wiki-knowledge
+      config:
+        # Storage + data directory for the knowledge base (JSON store + uploaded
+        # documents). Defaults to "<profile data dir>/kb" when empty.
+        dataDir: ''
+        # Optional DeepSeek API key. When empty, parsing runs fully local
+        # (heuristic chunking + co-occurrence graph). When set, the host half
+        # calls DeepSeek to produce richer summaries, entities, and cross-links.
+        deepseekApiKey: ''
+        deepseekBaseUrl: 'https://api.deepseek.com'
+        deepseekModel: 'deepseek-chat'
+        # Max concurrent parse tasks.
+        maxConcurrent: 2
+        # Fixed loopback port for the self-hosted /kb-api server (must match the
+        # client half's API_BASE in client.tsx).
+        apiPort: 18771
